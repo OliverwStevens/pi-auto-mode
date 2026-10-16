@@ -1,14 +1,15 @@
 /**
  * pi-auto-mode
  *
- * /auto [on|off|status]. When on, permission `ask`s are resolved here instead of
- * by the human:
- *   1. ask matched by an explicit rule in the user's policy  -> hard deny (no classifier)
- *   2. ask from the default fallthrough                      -> local oMLX classifier
- *   3. classifier escalate / error / timeout                 -> human dialog (fail closed)
- * `deny` rules are enforced by pi-permission-system and never reach this code.
+ * /auto [on|off] or shift+tab toggles auto mode. While on, an `ask` that reaches the
+ * permission system's authorizer chain is resolved here instead of by the human:
+ *   1. ask matched by an explicit rule in the user's policy -> deny, classifier never runs
+ *   2. ask from the default fallthrough                     -> local OpenAI-compatible classifier
+ *   3. classifier unsure / error / timeout                  -> defer (human dialog)
+ * `deny` rules are enforced by the permission system before the chain and never reach here.
  *
- * Needs the askResolver hook in @gotgenes/pi-permission-system (see patch/apply-patch.sh).
+ * Requires @gotgenes/pi-permission-system >= 40 and `"authorizerChain": ["auto-mode"]`
+ * in its config (bin/setup.sh does both).
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { existsSync, readFileSync } from "node:fs"
@@ -16,12 +17,10 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { classify, type ClassifierConfig } from "./classifier.js"
 
-const RESOLVER_KEY = Symbol.for("pi-permission-system.askResolver")
+const SERVICES_KEY = Symbol.for("@gotgenes/pi-permission-system:session-services")
+const LINK_NAME = "auto-mode"
 
-interface AutoConfig extends Partial<ClassifierConfig> {
-  maxConsecutiveDenials?: number
-  maxUserMessages?: number
-}
+type Verdict = { kind: "allow" } | { kind: "deny"; reason?: string } | { kind: "defer" }
 
 interface AskDetails {
   toolName?: string
@@ -31,15 +30,22 @@ interface AskDetails {
   toolInputPreview?: string
 }
 
-type Decision = {
-  approved: boolean
-  state: "approved" | "denied" | "denied_with_reason"
-  denialReason?: string
-  autoApproved?: true
+interface Query {
+  checkPermission(surface: string, value?: string): { state: string; matchedPattern?: string }
 }
 
-function loadConfig(cwd: string): Required<AutoConfig> {
-  const defaults: Required<AutoConfig> = {
+interface Log {
+  review(event: string, details?: Record<string, unknown>): void
+}
+
+type Config = Required<Omit<ClassifierConfig, "rubricExtra">> & {
+  rubricExtra: string
+  maxConsecutiveDenials: number
+  maxUserMessages: number
+}
+
+function loadConfig(cwd: string): Config {
+  let out: Config = {
     baseUrl: "http://localhost:8001/v1",
     apiKey: "1234",
     model: "gemma-4-26B-A4B-it-qat-nvfp4",
@@ -48,12 +54,11 @@ function loadConfig(cwd: string): Required<AutoConfig> {
     maxConsecutiveDenials: 3,
     maxUserMessages: 5,
   }
-  const paths = [
-    join(homedir(), ".pi/agent/extensions/pi-auto-mode/config.json"),
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent")
+  for (const p of [
+    join(agentDir, "extensions/pi-auto-mode/config.json"),
     join(cwd, ".pi/extensions/pi-auto-mode/config.json"),
-  ]
-  let out = defaults
-  for (const p of paths) {
+  ]) {
     if (!existsSync(p)) continue
     try {
       out = { ...out, ...JSON.parse(readFileSync(p, "utf-8")) }
@@ -62,128 +67,131 @@ function loadConfig(cwd: string): Required<AutoConfig> {
   return out
 }
 
-function getService(): any {
-  // pi-permission-system publishes its service under a module-private symbol; find it by description.
-  const g = globalThis as Record<symbol, unknown>
-  for (const s of Object.getOwnPropertySymbols(g)) {
-    const v: any = g[s]
-    if (v && typeof v.checkPermission === "function" && typeof v.getToolPermission === "function") return v
-  }
-  return undefined
-}
-
 function userMessages(ctx: ExtensionContext, max: number): string[] {
   const out: string[] = []
   for (const e of ctx.sessionManager.getBranch() as any[]) {
     if (e.type !== "message" || e.message?.role !== "user") continue
     const c = e.message.content
-    const text = typeof c === "string" ? c : (c ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n")
+    const text =
+      typeof c === "string"
+        ? c
+        : (c ?? []).filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n")
     if (text.trim()) out.push(text.trim().slice(0, 1500))
   }
   return out.slice(-max)
 }
 
+/** An `ask` caused by an explicit rule in the policy is a stance, not a gap. */
+function explicitAsk(query: Query, d: AskDetails): string | undefined {
+  const probes: [string, string | undefined][] = [[d.toolName ?? "", d.command ?? d.path ?? d.target]]
+  if (d.toolName === "bash" && d.command) probes.unshift(["bash", d.command])
+  if (d.path) probes.push(["external_directory", d.path], ["path", d.path])
+  for (const [surface, value] of probes) {
+    if (!surface) continue
+    try {
+      const r = query.checkPermission(surface, value)
+      if (r.state === "ask" && r.matchedPattern && r.matchedPattern !== "*") {
+        return `${surface} rule '${r.matchedPattern}'`
+      }
+    } catch {}
+  }
+  return undefined
+}
+
 export default function (pi: ExtensionAPI) {
   let enabled = false
   let consecutiveDenials = 0
+  let ctxRef: ExtensionContext | undefined
+  const disposers = new Map<string, () => void>() // sessionId -> unregister
 
-  const setStatus = (ctx: ExtensionContext) =>
-    ctx.ui?.setStatus("auto-mode", enabled ? "auto" : undefined)
+  const setStatus = (ctx: ExtensionContext) => ctx.ui?.setStatus("auto-mode", enabled ? "auto" : undefined)
 
-  /** Explicit rule in the user's policy that says `ask` -> a stance, not a gap. */
-  function explicitAsk(d: AskDetails): string | undefined {
-    const svc = getService()
-    if (!svc) return undefined
-    const probes: [string, string | undefined][] = [
-      [d.toolName ?? "", d.command ?? d.path ?? d.target],
-    ]
-    if (d.toolName === "bash" && d.command) probes.unshift(["bash", d.command])
-    if (d.path) probes.push(["external_directory", d.path], ["path", d.path])
-    for (const [surface, value] of probes) {
-      if (!surface) continue
-      try {
-        const r = svc.checkPermission(surface, value)
-        if (r.state === "ask" && r.matchedPattern && r.matchedPattern !== "*") {
-          return `${surface} rule '${r.matchedPattern}'`
-        }
-      } catch {}
-    }
-    return undefined
+  function toggle(ctx: ExtensionContext, next?: boolean) {
+    enabled = next ?? !enabled
+    consecutiveDenials = 0
+    setStatus(ctx)
+    ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${loadConfig(ctx.cwd).model})`, "info")
   }
 
-  async function resolve(ctx: ExtensionContext, d: AskDetails): Promise<Decision | undefined> {
-    if (!enabled) return undefined
+  async function authorize(d: AskDetails, query: Query, log: Log): Promise<Verdict> {
+    const ctx = ctxRef
+    if (!enabled || !ctx) return { kind: "defer" }
 
-    const stance = explicitAsk(d)
+    const stance = explicitAsk(query, d)
     if (stance) {
-      return deny(`Blocked by auto mode: matches ${stance}. Ask the user.`)
+      log.review("auto_mode_stance_denied", { rule: stance })
+      return { kind: "deny", reason: `Blocked by auto mode: matches ${stance}. Ask the user.` }
     }
 
     const cfg = loadConfig(ctx.cwd)
     const summary = d.command ?? d.path ?? d.target ?? d.toolInputPreview ?? "(no detail)"
     let verdict
     try {
-      verdict = await classify(
-        cfg as ClassifierConfig,
-        { userMessages: userMessages(ctx, cfg.maxUserMessages), toolName: d.toolName ?? "unknown", summary, cwd: ctx.cwd },
-      )
+      verdict = await classify(cfg, {
+        userMessages: userMessages(ctx, cfg.maxUserMessages),
+        toolName: d.toolName ?? "unknown",
+        summary,
+        cwd: ctx.cwd,
+      })
     } catch (e: any) {
       verdict = { decision: "escalate" as const, reason: `classifier error: ${e?.name ?? e}` }
     }
+    log.review("auto_mode_verdict", { decision: verdict.decision, reason: verdict.reason, model: cfg.model })
 
     if (verdict.decision === "allow") {
       consecutiveDenials = 0
-      return { approved: true, state: "approved", autoApproved: true }
+      return { kind: "allow" }
     }
     if (verdict.decision === "deny") {
       consecutiveDenials++
       if (consecutiveDenials >= cfg.maxConsecutiveDenials) {
         consecutiveDenials = 0
         ctx.ui?.notify(`auto mode: ${cfg.maxConsecutiveDenials} denials in a row, asking you`, "warning")
-        return undefined
+        return { kind: "defer" }
       }
-      return deny(`Blocked by auto mode: ${verdict.reason}`)
+      return { kind: "deny", reason: `Blocked by auto mode: ${verdict.reason}` }
     }
-    return undefined // escalate: human dialog
+    return { kind: "defer" }
   }
 
-  function deny(reason: string): Decision {
-    return { approved: false, state: "denied_with_reason", denialReason: reason }
-  }
-
-  ;(globalThis as Record<symbol, unknown>)[RESOLVER_KEY] = resolve
+  // The service is published per session node; `permissions:ready` may fire more than once.
+  pi.events.on("permissions:ready", (data: any) => {
+    const sessionId = data?.sessionId as string | undefined
+    if (!sessionId || disposers.has(sessionId)) return
+    const services = (globalThis as Record<symbol, unknown>)[SERVICES_KEY] as Map<string, any> | undefined
+    const service = services?.get(sessionId)
+    if (!service?.registerAuthorizer) return
+    try {
+      disposers.set(sessionId, service.registerAuthorizer(LINK_NAME, authorize))
+    } catch {}
+  })
 
   pi.registerCommand("auto", {
-    description: "Auto mode: /auto [on|off|status]",
+    description: "Auto mode: /auto [on|off]",
     handler: async (args, ctx) => {
       const a = args.trim().toLowerCase()
-      if (a === "on" || a === "off") enabled = a === "on"
-      else if (a === "" ) enabled = !enabled
-      consecutiveDenials = 0
-      setStatus(ctx)
-      const cfg = loadConfig(ctx.cwd)
-      ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${cfg.model})`, "info")
+      toggle(ctx, a === "on" ? true : a === "off" ? false : undefined)
     },
   })
 
-  // Same key as Claude Code's mode cycle. Pi's thinking-level cycle is rebound to alt+t in
-  // ~/.pi/agent/keybindings.json so this shortcut is free.
+  // Same key as Claude Code's mode cycle. Pi's thinking-level cycle is rebound to alt+t
+  // in ~/.pi/agent/keybindings.json so this shortcut is free.
   pi.registerShortcut("shift+tab", {
     description: "Toggle auto mode",
-    handler: (ctx) => {
-      enabled = !enabled
-      consecutiveDenials = 0
-      setStatus(ctx)
-      ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"}`, "info")
-    },
+    handler: (ctx) => toggle(ctx),
   })
 
   pi.on("session_start", (_e, ctx) => {
+    ctxRef = ctx
     enabled = false
     setStatus(ctx)
   })
   pi.on("session_shutdown", () => {
-    if ((globalThis as Record<symbol, unknown>)[RESOLVER_KEY] === resolve)
-      delete (globalThis as Record<symbol, unknown>)[RESOLVER_KEY]
+    for (const dispose of disposers.values()) {
+      try {
+        dispose()
+      } catch {}
+    }
+    disposers.clear()
   })
 }

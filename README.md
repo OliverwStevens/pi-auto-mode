@@ -4,18 +4,18 @@ Auto mode for the [pi](https://pi.dev) coding agent, similar to Claude Code's au
 
 ## How it works
 
-When auto mode is on, each permission `ask` from `@gotgenes/pi-permission-system` is resolved in this order:
+`pi-auto-mode` registers an authorizer-chain link (`auto-mode`) with `@gotgenes/pi-permission-system`. When auto mode is on, each permission `ask` reaching that chain is resolved in this order:
 
 1. `deny` rules and `path` deny rules block first. Auto mode never overrides them.
 2. An `ask` caused by an **explicit rule** in your policy (for example `git push *: ask`) is denied without calling the classifier. The agent sees `Blocked by auto mode: ...`.
 3. Any other `ask` goes to a classifier model on an OpenAI-compatible endpoint (oMLX, Ollama, LM Studio, vLLM). It sees your recent requests and the proposed call, and answers allow, deny or escalate.
-4. Escalate, error or timeout falls back to the normal human dialog. Three denials in a row also fall back to the dialog.
+4. Escalate, error or timeout defers to the normal human dialog. Three denials in a row also fall back to the dialog.
 
 Toggle with `shift+tab` or `/auto [on|off]`. The footer shows `auto` while on. Auto mode starts off each session.
 
 ## Install
 
-Requires pi and an OpenAI-compatible model server.
+Requires pi, python3, and an OpenAI-compatible model server. Needs `@gotgenes/pi-permission-system` **>= 40**; `setup.sh` installs the latest.
 
 ```bash
 git clone https://github.com/OliverwStevens/pi-auto-mode
@@ -25,13 +25,13 @@ cd pi-auto-mode
 
 `setup.sh`:
 - installs `@gotgenes/pi-permission-system` and this package,
-- applies a small patch that lets an extension answer an `ask` (`bin/apply-patch.sh`),
+- adds `"auto-mode"` to `authorizerChain` in the permission-system config (a link decides nothing until named there),
 - rebinds pi's thinking-level cycle from `shift+tab` to `alt+t`,
 - writes `~/.pi/agent/extensions/pi-auto-mode/config.json` if missing.
 
 Then run `/reload` in pi.
 
-Re-run `bin/apply-patch.sh` after any update of `@gotgenes/pi-permission-system`. It is idempotent and keeps a `.orig` backup.
+No patching is involved. Auto mode uses the permission system's public `registerAuthorizer` API.
 
 ## Config
 
@@ -51,8 +51,9 @@ Re-run `bin/apply-patch.sh` after any update of `@gotgenes/pi-permission-system`
 
 - The classifier is an LLM. Treat it as a convenience, not a security boundary. Keep hard limits in `deny` rules.
 - Tool output is never shown to the classifier, which limits prompt injection.
-- Prompts forwarded from subagents do not go through auto mode yet.
-- The patch edits a file inside `node_modules`. Ask the permission-system author for an official hook if you depend on this long term.
+- The permission system caps a link's `allow` on `path` and `external_directory` asks: those still reach you as a dialog. Put allows for outside-project paths in your policy.
+- A subagent's ask is reviewed one hop up by the session you watch, so auto mode covers subagents too.
+- The permission config must live at `~/.pi/agent/extensions/pi-permission-system/config.json` (global) or `<cwd>/.pi/extensions/pi-permission-system/config.json`.
 
 ## License
 

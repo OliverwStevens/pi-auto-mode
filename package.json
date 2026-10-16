@@ -7,6 +7,6 @@
   "pi": { "extensions": ["./extensions/auto-mode.ts"] },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@gotgenes/pi-permission-system": ">=16.1.0"
+    "@gotgenes/pi-permission-system": ">=40.0.0"
   }
 }
