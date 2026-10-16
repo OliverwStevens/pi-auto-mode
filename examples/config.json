@@ -1,0 +1,9 @@
+{
+  "baseUrl": "http://localhost:8001/v1",
+  "apiKey": "1234",
+  "model": "gemma-4-26B-A4B-it-qat-nvfp4",
+  "timeoutMs": 20000,
+  "maxConsecutiveDenials": 3,
+  "maxUserMessages": 5,
+  "rubricExtra": ""
+}
