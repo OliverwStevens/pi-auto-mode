@@ -1,9 +1,16 @@
 {
   "name": "pi-auto-mode",
-  "version": "0.0.1",
-  "description": "Auto mode for pi: a local oMLX classifier resolves permission asks.",
+  "version": "0.0.2",
+  "description": "Auto mode for pi: a local OpenAI-compatible classifier resolves permission asks.",
   "type": "module",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/OliverwStevens/pi-auto-mode.git" },
+  "engines": { "node": ">=22.6" },
+  "files": ["extensions", "bin", "examples", "README.md", "LICENSE"],
   "keywords": ["pi-package", "pi-extension"],
+  "scripts": {
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
   "pi": { "extensions": ["./extensions/auto-mode.ts"] },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

@@ -14,42 +14,44 @@ pi install npm:@gotgenes/pi-permission-system@latest
 echo "==> installing pi-auto-mode from $HERE"
 pi install "$HERE"
 
+# Edit a JSON file via python: fail with a hand-edit hint on non-plain JSON, write atomically.
+edit_json() { # file, hint, python body operating on dict `d`
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, os, sys, tempfile
+p, hint, body = sys.argv[1:4]
+try:
+    d = json.load(open(p)) if os.path.exists(p) else {}
+except json.JSONDecodeError:
+    sys.exit(f"{p} is not plain JSON (comments?). {hint}")
+exec(body)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+os.replace(tmp, p)
+PY
+}
+
 echo "==> freeing shift+tab (thinking cycle -> alt+t)"
 mkdir -p "$AGENT_DIR"
-python3 - "$AGENT_DIR/keybindings.json" <<'PY'
-import json, os, sys
-p = sys.argv[1]
-d = json.load(open(p)) if os.path.exists(p) else {}
-d.setdefault("app.thinking.cycle", ["alt+t"])
-json.dump(d, open(p, "w"), indent=2)
-PY
+edit_json "$AGENT_DIR/keybindings.json" \
+  'Set "app.thinking.cycle": ["alt+t"] by hand.' \
+  'd.setdefault("app.thinking.cycle", ["alt+t"])'
 
 echo "==> adding auto-mode to authorizerChain"
 PERM="$AGENT_DIR/extensions/pi-permission-system/config.json"
 mkdir -p "$(dirname "$PERM")"
-python3 - "$PERM" <<'PY'
-import json, os, sys
-p = sys.argv[1]
-try:
-    d = json.load(open(p)) if os.path.exists(p) else {}
-except json.JSONDecodeError:
-    sys.exit(f"{p} is not plain JSON (comments?). Add \"authorizerChain\": [\"auto-mode\"] by hand.")
-chain = d.setdefault("authorizerChain", [])
-if "auto-mode" not in chain:
-    chain.append("auto-mode")
-json.dump(d, open(p, "w"), indent=2)
-PY
+edit_json "$PERM" \
+  'Add "authorizerChain": ["auto-mode"] by hand.' \
+  'chain = d.setdefault("authorizerChain", [])
+if "auto-mode" not in chain: chain.append("auto-mode")'
 
 CFG="$AGENT_DIR/extensions/pi-auto-mode/config.json"
 if [ ! -f "$CFG" ]; then
   mkdir -p "$(dirname "$CFG")"
   cp "$HERE/examples/config.json" "$CFG"
   if [ -n "$MODEL" ]; then
-    python3 - "$CFG" "$MODEL" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1])); d["model"] = sys.argv[2]
-json.dump(d, open(sys.argv[1], "w"), indent=2)
-PY
+    MODEL="$MODEL" edit_json "$CFG" 'Set "model" by hand.' 'd["model"] = os.environ["MODEL"]' 
   fi
   echo "==> wrote $CFG (edit baseUrl/model/apiKey for your OpenAI-compatible endpoint)"
 fi

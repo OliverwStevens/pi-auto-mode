@@ -9,7 +9,7 @@ Auto mode for the [pi](https://pi.dev) coding agent, similar to Claude Code's au
 1. `deny` rules and `path` deny rules block first. Auto mode never overrides them.
 2. An `ask` caused by an **explicit rule** in your policy (for example `git push *: ask`) is denied without calling the classifier. The agent sees `Blocked by auto mode: ...`.
 3. Any other `ask` goes to a classifier model on an OpenAI-compatible endpoint (oMLX, Ollama, LM Studio, vLLM). It sees your recent requests and the proposed call, and answers allow, deny or escalate.
-4. Escalate, error or timeout defers to the normal human dialog. Three denials in a row also fall back to the dialog.
+4. Escalate, error or timeout defers to the normal human dialog. After `maxConsecutiveDenials` denials (allows do not reset the count) auto mode asks you once and resets.
 
 Toggle with `shift+tab` or `/auto [on|off]`. The footer shows `auto` while on. Auto mode starts off each session.
 
@@ -31,11 +31,11 @@ cd pi-auto-mode
 
 Then run `/reload` in pi.
 
-No patching is involved. Auto mode uses the permission system's public `registerAuthorizer` API.
+No patching is involved. Auto mode calls the permission system's `registerAuthorizer`, but finds it through the `Symbol.for("@gotgenes/pi-permission-system:session-services")` global, which is an internal. If that changes, toggling auto mode shows a warning that the link is missing instead of failing silently. State (on/off, denial count) is per process, not per session.
 
 ## Config
 
-`~/.pi/agent/extensions/pi-auto-mode/config.json` (project override: `<cwd>/.pi/extensions/pi-auto-mode/config.json`):
+`~/.pi/agent/extensions/pi-auto-mode/config.json`. A project file `<cwd>/.pi/extensions/pi-auto-mode/config.json` may only set `timeoutMs` and `maxUserMessages`; other keys are ignored with a warning, so a cloned repo cannot redirect the classifier or rewrite its rubric. Invalid values are ignored with a warning.
 
 | key | default | meaning |
 | --- | --- | --- |
@@ -49,6 +49,8 @@ No patching is involved. Auto mode uses the permission system's public `register
 
 ## Safety notes
 
+- `baseUrl` is sent your recent messages and every proposed command. Use a local endpoint unless you trust the remote.
+- The proposed call is fenced and truncated to 4000 chars in the prompt, and the rubric escalates scripts whose contents it cannot see.
 - The classifier is an LLM. Treat it as a convenience, not a security boundary. Keep hard limits in `deny` rules.
 - Tool output is never shown to the classifier, which limits prompt injection.
 - The permission system caps a link's `allow` on `path` and `external_directory` asks: those still reach you as a dialog. Put allows for outside-project paths in your policy.
@@ -58,3 +60,7 @@ No patching is involved. Auto mode uses the permission system's public `register
 ## License
 
 MIT
+
+## Development
+
+`npm test` (Node >= 22.6) runs the verdict-parser tests.

@@ -8,6 +8,8 @@
  *   3. classifier unsure / error / timeout                  -> defer (human dialog)
  * `deny` rules are enforced by the permission system before the chain and never reach here.
  *
+ * Reaches the permission system through its session-services global (no public hook for this);
+ * if that changes, auto mode warns on toggle instead of failing silently.
  * Requires @gotgenes/pi-permission-system >= 40 and `"authorizerChain": ["auto-mode"]`
  * in its config (bin/setup.sh does both).
  */
@@ -15,7 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { classify, type ClassifierConfig } from "./classifier.js"
+import { classify, type Verdict as ClassifierVerdict } from "./classifier.js"
 
 const SERVICES_KEY = Symbol.for("@gotgenes/pi-permission-system:session-services")
 const LINK_NAME = "auto-mode"
@@ -38,33 +40,73 @@ interface Log {
   review(event: string, details?: Record<string, unknown>): void
 }
 
-type Config = Required<Omit<ClassifierConfig, "rubricExtra">> & {
+interface Config {
+  baseUrl: string
+  apiKey: string
+  model: string
+  timeoutMs: number
   rubricExtra: string
   maxConsecutiveDenials: number
   maxUserMessages: number
 }
 
-function loadConfig(cwd: string): Config {
-  let out: Config = {
-    baseUrl: "http://localhost:8001/v1",
-    apiKey: "1234",
-    model: "gemma-4-26B-A4B-it-qat-nvfp4",
-    timeoutMs: 20000,
-    rubricExtra: "",
-    maxConsecutiveDenials: 3,
-    maxUserMessages: 5,
+const DEFAULTS: Config = {
+  baseUrl: "http://localhost:8001/v1",
+  apiKey: "1234",
+  model: "gemma-4-26B-A4B-it-qat-nvfp4",
+  timeoutMs: 20000,
+  rubricExtra: "",
+  maxConsecutiveDenials: 3,
+  maxUserMessages: 5,
+}
+
+const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 1
+const VALIDATORS: { [K in keyof Config]: (v: unknown) => boolean } = {
+  baseUrl: (v) => typeof v === "string" && /^https?:\/\//.test(v),
+  apiKey: (v) => typeof v === "string",
+  model: (v) => typeof v === "string" && v.length > 0,
+  timeoutMs: isPosInt,
+  rubricExtra: (v) => typeof v === "string",
+  maxConsecutiveDenials: isPosInt,
+  maxUserMessages: isPosInt,
+}
+
+// A repo-local file is untrusted: it must not redirect the classifier endpoint or rewrite its rubric.
+const PROJECT_KEYS: (keyof Config)[] = ["timeoutMs", "maxUserMessages"]
+
+function readConfigFile(path: string, allowed: (keyof Config)[], onWarn?: (msg: string) => void): Partial<Config> {
+  if (!existsSync(path)) return {}
+  let raw: Record<string, unknown>
+  try {
+    raw = JSON.parse(readFileSync(path, "utf-8"))
+  } catch (e: any) {
+    onWarn?.(`auto mode: ignoring ${path}: ${e?.message ?? e}`)
+    return {}
   }
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(raw ?? {})) {
+    if (!(k in VALIDATORS)) continue
+    if (!allowed.includes(k as keyof Config)) {
+      onWarn?.(`auto mode: ${path}: '${k}' is only honored in the global config`)
+      continue
+    }
+    if (VALIDATORS[k as keyof Config](v)) out[k] = v
+    else onWarn?.(`auto mode: ${path}: invalid value for '${k}'`)
+  }
+  return out as Partial<Config>
+}
+
+function loadConfig(cwd: string, onWarn?: (msg: string) => void): Config {
   const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent")
-  for (const p of [
-    join(agentDir, "extensions/pi-auto-mode/config.json"),
-    join(cwd, ".pi/extensions/pi-auto-mode/config.json"),
-  ]) {
-    if (!existsSync(p)) continue
-    try {
-      out = { ...out, ...JSON.parse(readFileSync(p, "utf-8")) }
-    } catch {}
+  return {
+    ...DEFAULTS,
+    ...readConfigFile(
+      join(agentDir, "extensions/pi-auto-mode/config.json"),
+      Object.keys(DEFAULTS) as (keyof Config)[],
+      onWarn,
+    ),
+    ...readConfigFile(join(cwd, ".pi/extensions/pi-auto-mode/config.json"), PROJECT_KEYS, onWarn),
   }
-  return out
 }
 
 function userMessages(ctx: ExtensionContext, max: number): string[] {
@@ -84,7 +126,6 @@ function userMessages(ctx: ExtensionContext, max: number): string[] {
 /** An `ask` caused by an explicit rule in the policy is a stance, not a gap. */
 function explicitAsk(query: Query, d: AskDetails): string | undefined {
   const probes: [string, string | undefined][] = [[d.toolName ?? "", d.command ?? d.path ?? d.target]]
-  if (d.toolName === "bash" && d.command) probes.unshift(["bash", d.command])
   if (d.path) probes.push(["external_directory", d.path], ["path", d.path])
   for (const [surface, value] of probes) {
     if (!surface) continue
@@ -106,11 +147,36 @@ export default function (pi: ExtensionAPI) {
 
   const setStatus = (ctx: ExtensionContext) => ctx.ui?.setStatus("auto-mode", enabled ? "auto" : undefined)
 
+  function register(sessionId: string, service: any): void {
+    if (disposers.has(sessionId) || !service?.registerAuthorizer) return
+    try {
+      disposers.set(sessionId, service.registerAuthorizer(LINK_NAME, authorize))
+    } catch (e: any) {
+      ctxRef?.ui?.notify(`auto mode: registerAuthorizer failed: ${e?.message ?? e}`, "warning")
+    }
+  }
+
+  /** Catches sessions whose `permissions:ready` fired before this extension loaded (e.g. after /reload). */
+  function registerExisting(): void {
+    const services = (globalThis as Record<symbol, unknown>)[SERVICES_KEY] as Map<string, any> | undefined
+    for (const [sessionId, service] of services ?? []) register(sessionId, service)
+  }
+
   function toggle(ctx: ExtensionContext, next?: boolean) {
     enabled = next ?? !enabled
     consecutiveDenials = 0
     setStatus(ctx)
-    ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${loadConfig(ctx.cwd).model})`, "info")
+    const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
+    ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${cfg.model})`, "info")
+    if (enabled) {
+      registerExisting()
+      if (disposers.size === 0) {
+        ctx.ui?.notify(
+          'auto mode: not linked to @gotgenes/pi-permission-system (>= 40, "authorizerChain": ["auto-mode"]); prompts still go to you',
+          "warning",
+        )
+      }
+    }
   }
 
   async function authorize(d: AskDetails, query: Query, log: Log): Promise<Verdict> {
@@ -125,7 +191,7 @@ export default function (pi: ExtensionAPI) {
 
     const cfg = loadConfig(ctx.cwd)
     const summary = d.command ?? d.path ?? d.target ?? d.toolInputPreview ?? "(no detail)"
-    let verdict
+    let verdict: ClassifierVerdict
     try {
       verdict = await classify(cfg, {
         userMessages: userMessages(ctx, cfg.maxUserMessages),
@@ -134,19 +200,17 @@ export default function (pi: ExtensionAPI) {
         cwd: ctx.cwd,
       })
     } catch (e: any) {
-      verdict = { decision: "escalate" as const, reason: `classifier error: ${e?.name ?? e}` }
+      verdict = { decision: "escalate", reason: `classifier error: ${e?.name ?? e}` }
     }
     log.review("auto_mode_verdict", { decision: verdict.decision, reason: verdict.reason, model: cfg.model })
 
-    if (verdict.decision === "allow") {
-      consecutiveDenials = 0
-      return { kind: "allow" }
-    }
+    if (verdict.decision === "allow") return { kind: "allow" }
     if (verdict.decision === "deny") {
+      // Not reset by allows: interleaving allowed calls must not let the agent probe forever.
       consecutiveDenials++
       if (consecutiveDenials >= cfg.maxConsecutiveDenials) {
         consecutiveDenials = 0
-        ctx.ui?.notify(`auto mode: ${cfg.maxConsecutiveDenials} denials in a row, asking you`, "warning")
+        ctx.ui?.notify(`auto mode: ${cfg.maxConsecutiveDenials} denials, asking you`, "warning")
         return { kind: "defer" }
       }
       return { kind: "deny", reason: `Blocked by auto mode: ${verdict.reason}` }
@@ -157,20 +221,17 @@ export default function (pi: ExtensionAPI) {
   // The service is published per session node; `permissions:ready` may fire more than once.
   pi.events.on("permissions:ready", (data: any) => {
     const sessionId = data?.sessionId as string | undefined
-    if (!sessionId || disposers.has(sessionId)) return
+    if (!sessionId) return
     const services = (globalThis as Record<symbol, unknown>)[SERVICES_KEY] as Map<string, any> | undefined
-    const service = services?.get(sessionId)
-    if (!service?.registerAuthorizer) return
-    try {
-      disposers.set(sessionId, service.registerAuthorizer(LINK_NAME, authorize))
-    } catch {}
+    register(sessionId, services?.get(sessionId))
   })
 
   pi.registerCommand("auto", {
     description: "Auto mode: /auto [on|off]",
     handler: async (args, ctx) => {
       const a = args.trim().toLowerCase()
-      toggle(ctx, a === "on" ? true : a === "off" ? false : undefined)
+      if (a === "" || a === "on" || a === "off") return toggle(ctx, a === "" ? undefined : a === "on")
+      ctx.ui?.notify("usage: /auto [on|off]", "warning")
     },
   })
 
@@ -184,7 +245,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_e, ctx) => {
     ctxRef = ctx
     enabled = false
+    consecutiveDenials = 0
     setStatus(ctx)
+    registerExisting()
   })
   pi.on("session_shutdown", () => {
     for (const dispose of disposers.values()) {
@@ -193,5 +256,7 @@ export default function (pi: ExtensionAPI) {
       } catch {}
     }
     disposers.clear()
+    ctxRef = undefined
+    enabled = false
   })
 }
