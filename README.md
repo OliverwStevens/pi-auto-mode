@@ -42,7 +42,7 @@ You need:
 ```bash
 git clone https://github.com/OliverwStevens/pi-auto-mode
 cd pi-auto-mode
-./bin/setup.sh [classifier-model-id]
+./bin/setup.sh [clef-model-id]
 ```
 
 Then run `/reload` in pi. `setup.sh` is safe to run again.
@@ -52,7 +52,7 @@ Then run `/reload` in pi. `setup.sh` is safe to run again.
 1. Installs `@gotgenes/pi-permission-system` and this package with `pi install`.
 2. Rebinds pi's thinking-level cycle from `shift+tab` to `alt+t` in `~/.pi/agent/keybindings.json`, which frees `shift+tab` for auto mode.
 3. Adds `"auto-mode"` to `authorizerChain` in the permission system's config. A link does nothing until it is named there.
-4. Writes `~/.pi/agent/extensions/pi-auto-mode/config.json` from `examples/config.json` if it does not exist, with your model id if you passed one.
+4. Writes `~/.pi/agent/extensions/pi-auto-mode/config.json` from `examples/config.json` if it does not exist, with your Clef model id if you passed one.
 
 If one of the JSON files contains comments, `setup.sh` stops and tells you which line to add by hand. It never overwrites a file it cannot parse.
 
@@ -69,10 +69,15 @@ Auto mode calls the permission system's `registerAuthorizer` function, but it fi
 | `shift+tab` | toggle auto mode |
 | `/auto` | toggle auto mode |
 | `/auto on` / `/auto off` | set it explicitly |
+| `/auto classifier [clef\|gemma]` | switch classifier for this session, or show the current one |
 
 - The footer shows `auto` while auto mode is on.
 - Auto mode is **off at the start of every session**.
 - The on/off state and the denial count are kept per process, not per session.
+
+## Clef
+
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a decision model, not a chat model. It scores allow/deny/escalate in one forward pass through the server's `POST /v1/systemone`. oMLX serves it: load `Jundot/clef-flash-oQ4e` (it keeps the schema head), set `"clef": {"model": "<id from /v1/models>"}`. Clef is the default classifier. To use a chat model instead, run `/auto classifier gemma` or set `"classifier": "gemma"` and `model`. An answer with confidence below 0.7 counts as `escalate`.
 
 ## Config
 
@@ -80,9 +85,11 @@ The global config is `~/.pi/agent/extensions/pi-auto-mode/config.json`:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `baseUrl` | `http://localhost:8001/v1` | OpenAI-compatible endpoint. `/chat/completions` is appended. |
+| `baseUrl` | `http://127.0.0.1:8001/v1` | OpenAI-compatible endpoint. `/chat/completions` (or `/systemone` for Clef) is appended. |
 | `apiKey` | `1234` | Bearer token sent to the endpoint |
-| `model` | `gemma-4-26B-A4B-it-qat-nvfp4` | Classifier model id |
+| `model` | `gemma-4-26B-A4B-it-qat-nvfp4` | Gemma model id, used when `classifier` is `gemma` |
+| `classifier` | `clef` | `clef` (decision model at `/systemone`) or `gemma` (any chat model at `/chat/completions`). `/auto classifier` overrides it per session. |
+| `clef` | `{"model":"clef-flash-oQ4e"}` | Clef model id on the server. Optional `baseUrl` and `apiKey` default to the top-level ones. |
 | `timeoutMs` | `20000` | Time to wait for the classifier before asking you |
 | `maxConsecutiveDenials` | `3` | Classifier denials before asking you |
 | `maxUserMessages` | `5` | Recent user messages shown to the classifier |
