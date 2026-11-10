@@ -14,10 +14,10 @@
  * in its config (bin/setup.sh does both).
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
-import { classify, type ClassifierConfig, type Verdict as ClassifierVerdict } from "./classifier.js"
+import { join, relative, resolve, sep } from "node:path"
+import { classify, type ClassifierConfig, type ComfortLevel, type Verdict as ClassifierVerdict } from "./classifier.js"
 
 const SERVICES_KEY = Symbol.for("@gotgenes/pi-permission-system:session-services")
 const LINK_NAME = "auto-mode"
@@ -49,8 +49,12 @@ interface Config {
   maxConsecutiveDenials: number
   maxUserMessages: number
   classifier: "gemma" | "clef"
+  /** Comfort level for the safety rubric. Defaults to "cautious". */
+  comfortLevel: ComfortLevel
   /** Used when classifier is "clef"; baseUrl/apiKey default to the top-level ones. */
   clef: { model: string; baseUrl?: string; apiKey?: string }
+  /** Start auto mode ON for new sessions. (session-scoped) */
+  alwaysOn: boolean
 }
 
 const DEFAULTS: Config = {
@@ -58,12 +62,16 @@ const DEFAULTS: Config = {
   apiKey: "1234",
   model: "gemma-4-26B-A4B-it-qat-nvfp4",
   classifier: "clef",
+  comfortLevel: "cautious",
   clef: { model: "clef-flash-oQ4e" },
   timeoutMs: 20000,
   rubricExtra: "",
   maxConsecutiveDenials: 3,
   maxUserMessages: 5,
+  alwaysOn: false,
 }
+
+const isLevel = (v: unknown): v is ComfortLevel => v === "cautious" || v === "balanced" || v === "liberal"
 
 const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 1
 const VALIDATORS: { [K in keyof Config]: (v: unknown) => boolean } = {
@@ -75,6 +83,8 @@ const VALIDATORS: { [K in keyof Config]: (v: unknown) => boolean } = {
   maxConsecutiveDenials: isPosInt,
   maxUserMessages: isPosInt,
   classifier: (v) => v === "gemma" || v === "clef",
+  comfortLevel: isLevel,
+  alwaysOn: (v) => typeof v === "boolean",
   clef: (v: any) =>
     !!v &&
     typeof v.model === "string" &&
@@ -109,11 +119,12 @@ function readConfigFile(path: string, allowed: (keyof Config)[], onWarn?: (msg: 
 }
 
 /** The classifier endpoint settings for the active classifier (Gemma chat or Clef SystemOne). */
-function activeClassifier(cfg: Config, override?: Config["classifier"]): ClassifierConfig {
+function activeClassifier(cfg: Config, override?: Config["classifier"], comfortLevel = cfg.comfortLevel): ClassifierConfig {
   const { baseUrl, apiKey, model, timeoutMs, rubricExtra } = cfg
-  return (override ?? cfg.classifier) === "clef"
-    ? { baseUrl, apiKey, timeoutMs, rubricExtra, ...cfg.clef, backend: "systemone" }
-    : { baseUrl, apiKey, model, timeoutMs, rubricExtra, backend: "chat" }
+  if ((override ?? cfg.classifier) === "clef") {
+    return { baseUrl, apiKey, timeoutMs, rubricExtra, comfortLevel, ...cfg.clef, backend: "systemone" }
+  }
+  return { baseUrl, apiKey, model, timeoutMs, rubricExtra, comfortLevel, backend: "chat" }
 }
 
 function loadConfig(cwd: string, onWarn?: (msg: string) => void): Config {
@@ -126,7 +137,7 @@ function loadConfig(cwd: string, onWarn?: (msg: string) => void): Config {
       onWarn,
     ),
     ...readConfigFile(join(cwd, ".pi/extensions/pi-auto-mode/config.json"), PROJECT_KEYS, onWarn),
-  }
+  } as Config
 }
 
 function userMessages(ctx: ExtensionContext, max: number): string[] {
@@ -141,6 +152,36 @@ function userMessages(ctx: ExtensionContext, max: number): string[] {
     if (text.trim()) out.push(text.trim().slice(0, 1500))
   }
   return out.slice(-max)
+}
+
+const SCRIPT_EXT = /\.(sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl|php)$/
+const MAX_SCRIPT_BYTES = 16_000
+const MAX_SCRIPTS = 3
+
+/** Sources of project scripts a command runs. Files outside the project are left for the classifier to judge by name. */
+function projectScripts(command: string | undefined, cwd: string): { path: string; source: string }[] {
+  if (!command) return []
+  const root = resolve(cwd)
+  const paths = new Set<string>()
+  for (const raw of command.split(/[\s;|&]+/)) {
+    const tok = raw.replace(/^['"]|['"]$/g, "")
+    if (!SCRIPT_EXT.test(tok) && !tok.startsWith("./")) continue
+    const abs = resolve(root, tok)
+    if (abs.startsWith(root + sep)) paths.add(abs)
+  }
+  const out: { path: string; source: string }[] = []
+  for (const abs of paths) {
+    if (out.length >= MAX_SCRIPTS) break
+    try {
+      if (!statSync(abs).isFile()) continue
+      const source = readFileSync(abs, "utf-8")
+      out.push({
+        path: relative(root, abs),
+        source: source.length > MAX_SCRIPT_BYTES ? `${source.slice(0, MAX_SCRIPT_BYTES)}\n[truncated]` : source,
+      })
+    } catch {}
+  }
+  return out
 }
 
 /** An `ask` caused by an explicit rule in the policy is a stance, not a gap. */
@@ -162,11 +203,13 @@ function explicitAsk(query: Query, d: AskDetails): string | undefined {
 export default function (pi: ExtensionAPI) {
   let enabled = false
   let override: Config["classifier"] | undefined // set by `/auto classifier`, lasts for the session
+  let comfortLevel: ComfortLevel = "cautious" // set by `/auto <level>`, lasts for the session
   let consecutiveDenials = 0
   let ctxRef: ExtensionContext | undefined
   const disposers = new Map<string, () => void>() // sessionId -> unregister
 
-  const setStatus = (ctx: ExtensionContext) => ctx.ui?.setStatus("auto-mode", enabled ? "auto" : undefined)
+  const setStatus = (ctx: ExtensionContext) =>
+    ctx.ui?.setStatus("auto-mode", enabled ? `auto: ${comfortLevel}` : undefined)
 
   function register(sessionId: string, service: any): void {
     if (disposers.has(sessionId) || !service?.registerAuthorizer) return
@@ -183,12 +226,16 @@ export default function (pi: ExtensionAPI) {
     for (const [sessionId, service] of services ?? []) register(sessionId, service)
   }
 
-  function toggle(ctx: ExtensionContext, next?: boolean) {
+  function toggle(ctx: ExtensionContext, next?: boolean, level?: ComfortLevel) {
     enabled = next ?? !enabled
+    if (level) comfortLevel = level
     consecutiveDenials = 0
     setStatus(ctx)
     const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
-    ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${activeClassifier(cfg, override).model})`, "info")
+    ctx.ui?.notify(
+      `auto mode ${enabled ? "ON" : "OFF"} (${comfortLevel}, classifier: ${activeClassifier(cfg, override).model})`,
+      "info",
+    )
     if (enabled) {
       registerExisting()
       if (disposers.size === 0) {
@@ -211,7 +258,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const cfg = loadConfig(ctx.cwd)
-    const active = activeClassifier(cfg, override)
+    const active = activeClassifier(cfg, override, comfortLevel)
     const summary = d.command ?? d.path ?? d.target ?? d.toolInputPreview ?? "(no detail)"
     let verdict: ClassifierVerdict
     try {
@@ -220,11 +267,17 @@ export default function (pi: ExtensionAPI) {
         toolName: d.toolName ?? "unknown",
         summary,
         cwd: ctx.cwd,
+        scripts: projectScripts(d.command, ctx.cwd),
       })
     } catch (e: any) {
       verdict = { decision: "escalate", reason: `classifier error: ${e?.name ?? e}` }
     }
-    log.review("auto_mode_verdict", { decision: verdict.decision, reason: verdict.reason, model: active.model })
+    log.review("auto_mode_verdict", {
+      decision: verdict.decision,
+      reason: verdict.reason,
+      model: active.model,
+      level: comfortLevel,
+    })
 
     if (verdict.decision === "allow") return { kind: "allow" }
     if (verdict.decision === "deny") {
@@ -249,18 +302,26 @@ export default function (pi: ExtensionAPI) {
   })
 
   pi.registerCommand("auto", {
-    description: "Auto mode: /auto [on|off] | /auto classifier [gemma|clef]",
+    description:
+      'Auto mode: /auto [on|off] | /auto <level> [on|off] | /auto classifier [gemma|clef]',
     handler: async (args, ctx) => {
       const a = args.trim().toLowerCase()
       if (a === "" || a === "on" || a === "off") return toggle(ctx, a === "" ? undefined : a === "on")
-      const [word, which] = a.split(/\s+/)
+      const parts = a.split(/\s+/)
+      if (isLevel(parts[0]) && (parts[1] === undefined || parts[1] === "on" || parts[1] === "off")) {
+        return toggle(ctx, parts[1] !== "off", parts[0])
+      }
+      const [word, which] = parts
       if (word === "classifier" && (which === undefined || which === "gemma" || which === "clef")) {
         if (which) override = which
         const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
         const c = activeClassifier(cfg, override)
         return ctx.ui?.notify(`auto mode classifier: ${override ?? cfg.classifier} (${c.model})`, "info")
       }
-      ctx.ui?.notify("usage: /auto [on|off] | /auto classifier [gemma|clef]", "warning")
+      ctx.ui?.notify(
+        "usage: /auto [on|off] | /auto <liberal|balanced|cautious> [on|off] | /auto classifier [gemma|clef]",
+        "warning",
+      )
     },
   })
 
@@ -273,7 +334,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_e, ctx) => {
     ctxRef = ctx
-    enabled = false
+    const cfg = loadConfig(ctx.cwd)
+    enabled = cfg.alwaysOn ?? false
+    comfortLevel = cfg.comfortLevel
     override = undefined
     consecutiveDenials = 0
     setStatus(ctx)

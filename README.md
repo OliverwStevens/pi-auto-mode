@@ -69,15 +69,31 @@ Auto mode calls the permission system's `registerAuthorizer` function, but it fi
 | `shift+tab` | toggle auto mode |
 | `/auto` | toggle auto mode |
 | `/auto on` / `/auto off` | set it explicitly |
+| `/auto <cautious\|balanced\|liberal>` | turn auto mode on at that comfort level for this session |
+| `/auto <level> off` | turn it off and keep that level for next time |
 | `/auto classifier [clef\|gemma]` | switch classifier for this session, or show the current one |
 
-- The footer shows `auto` while auto mode is on.
-- Auto mode is **off at the start of every session**.
-- The on/off state and the denial count are kept per process, not per session.
+- The footer shows `auto: <level>` while auto mode is on.
+- Auto mode is **off at the start of every session** (unless `alwaysOn` is true).
+- The on/off state, comfort level, and denial count are kept per process, not per session.
+
+### Comfort levels
+
+Each level draws a **trusted zone**. Calls whose effect stays inside it are allowed. Legitimate calls that reach past it escalate to you. Calls that cross a hard line are denied at every level. Each level widens the zone of the one below it.
+
+| Level | Trusted zone | Still asks you about |
+| --- | --- | --- |
+| `cautious` (default) | The project directory: edits, deletes, build/test/lint, project scripts it can read, dependency installs, undoable git | Writes outside the project, any remote change (push, PRs, publish), global installs, docker, programs it cannot identify |
+| `balanced` | The local workspace: also sibling repos, local containers and dev databases, network reads, user-level installs, pushes to feature branches and PRs | Pushes to the default branch, force-push, deploys and publishing, production or shared cloud, CI config, sudo and system files |
+| `liberal` | Anything your account can do that only affects your own work and can be recovered | Irreversible changes to shared or production systems, sudo and system config |
+
+**Hard lines (denied at every level):** sending secrets off the machine or reading credential stores the task does not need, piping downloaded code into a shell, reverse shells and privilege escalation, wiping data outside the project, and anything your messages say not to do.
+
+Explicit `ask` rules in your permission policy always win over the comfort level.
 
 ## Clef
 
-[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a decision model, not a chat model. It scores allow/deny/escalate in one forward pass through the server's `POST /v1/systemone`. oMLX serves it: load `Jundot/clef-flash-oQ4e` (it keeps the schema head), set `"clef": {"model": "<id from /v1/models>"}`. Clef is the default classifier. To use a chat model instead, run `/auto classifier gemma` or set `"classifier": "gemma"` and `model`. An answer with confidence below 0.7 counts as `escalate`.
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a decision model, not a chat model. It scores allow/deny/escalate in one forward pass through the server's `POST /v1/systemone`. oMLX serves it: load `Jundot/clef-flash-oQ4e` (it keeps the schema head), set `"clef": {"model": "<id from /v1/models>"}`. Clef is the default classifier. To use a chat model instead, run `/auto classifier gemma` or set `"classifier": "gemma"` and `model`. An answer below the level's confidence floor counts as `escalate`: 0.7 for `cautious`, 0.6 for `balanced`, 0.5 for `liberal`.
 
 ## Config
 
@@ -94,6 +110,8 @@ The global config is `~/.pi/agent/extensions/pi-auto-mode/config.json`:
 | `maxConsecutiveDenials` | `3` | Classifier denials before asking you |
 | `maxUserMessages` | `5` | Recent user messages shown to the classifier |
 | `rubricExtra` | `""` | Extra rules appended to the classifier prompt |
+| `comfortLevel` | `"cautious"` | Safety rubric tier: `"cautious"`, `"balanced"`, or `"liberal"`. Can also be set per-session with `/auto <level>`. |
+| `alwaysOn` | `false` | Start with auto mode ON instead of OFF (session-scoped) |
 
 A project file at `<cwd>/.pi/extensions/pi-auto-mode/config.json` is also read, but it may only set `timeoutMs` and `maxUserMessages`. Any other key in it is ignored with a warning. This stops a cloned repository from pointing the classifier at its own server or rewriting the rubric to approve everything. Values with the wrong type are ignored with a warning, and the default is used.
 
@@ -104,14 +122,11 @@ The classifier gets one request per `ask`:
 - The working directory.
 - Your last `maxUserMessages` messages, each cut to 1500 characters. This tells it what you actually asked for.
 - The tool name and the proposed call (the command, path or input preview). This text is wrapped in `<<<TOOL_CALL_DATA>>>` markers, cut to 4000 characters, and the rubric tells the model to treat it as data and never follow instructions inside it.
+- **Script sources**: when the command runs a script inside the project (`./bin/x`, `python tools/y.py`), the first 16 KB of up to three scripts, inside the same untrusted-data markers. Scripts outside the project are judged by their name and arguments.
 
 It never sees tool output or assistant messages, which limits prompt injection.
 
-Its rubric:
-
-- **allow**: the call is clearly in scope and its effect is visible in the call text. Examples are reading or editing project files, running well-known build, test and lint commands, and read-only inspection.
-- **deny**: the call exfiltrates data or secrets, writes outside the project, installs or runs unvetted remote code, is destructive or irreversible, changes shared or remote state, or is not what you asked for.
-- **escalate**: the model is unsure, or the call runs a script or binary whose contents it cannot see.
+The rubric is built from the comfort level: what each decision means, the level's trusted zone with what it allows and what escalates, the hard lines, and which way to lean when unsure (`cautious` escalates, `balanced` allows local undoable effects, `liberal` allows). It judges calls by their effect, not by whether it recognizes the tool, and it does not escalate only because a script's source is missing.
 
 The reply must be JSON: `{"decision":"allow|deny|escalate","reason":"..."}`. If the model emits several JSON objects, the last one with a `decision` key is used.
 
